@@ -1,5 +1,6 @@
 %% MySQL/OTP – MySQL client library for Erlang/OTP
 %% Copyright (C) 2014 Viktor Söderqvist
+%%               2017 Piotr Nosek
 %%
 %% This file is part of MySQL/OTP.
 %%
@@ -110,11 +111,26 @@ prepare_test() ->
                            warning_count = 0} when is_integer(StmtId),
                  Result),
     ok.
-    
+
 bad_protocol_version_test() ->
     Sock = mock_tcp:create([{recv, <<2, 0, 0, 0, 9, 0>>}]),
+    SSLOpts = undefined,
     ?assertError(unknown_protocol,
-                 mysql_protocol:handshake("foo", "bar", "db", mock_tcp, Sock)),
+                 mysql_protocol:handshake("foo", "bar", "db", mock_tcp,
+                                          SSLOpts, Sock, false)),
+    mock_tcp:close(Sock).
+
+error_as_initial_packet_test() ->
+    %% This behaviour has been observed from MariaDB 10.1.21
+    PacketBody = <<255,16,4,84,111,111,32,109,97,110,121,32,99,111,110,110,101,
+                   99,116,105,111,110,115>>,
+    Packet = <<(byte_size(PacketBody)):24/little-integer,
+               (_SeqNum = 0):8/integer, PacketBody/binary>>,
+    Sock = mock_tcp:create([{recv, Packet}]),
+    SSLOpts = undefined,
+    ?assertMatch(#error{code = 1040, msg = <<"Too many connections">>},
+                 mysql_protocol:handshake("foo", "bar", "db", mock_tcp,
+                                          SSLOpts, Sock, false)),
     mock_tcp:close(Sock).
 
 %% --- Helper functions for the above tests ---

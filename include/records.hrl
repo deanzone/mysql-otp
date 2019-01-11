@@ -27,6 +27,11 @@
                     auth_plugin_data :: binary(),
                     auth_plugin_name :: binary()}).
 
+-record(auth_method_switch, {
+          auth_plugin_name :: binary(),
+          auth_plugin_data :: binary()
+         }).
+
 %% OK packet, commonly used in the protocol.
 -record(ok, {affected_rows :: integer(),
              insert_id :: integer(),
@@ -34,7 +39,8 @@
              warning_count :: integer(),
              msg :: binary()}).
 %% Error packet, commonly used in the protocol.
--record(error, {code, state, msg}).
+-record(error, {code :: integer(), state :: binary() | undefined,
+                msg :: binary()}).
 
 %% EOF packet, commonly used in the protocol.
 -record(eof, {status, warning_count}).

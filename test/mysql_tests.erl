@@ -1,5 +1,6 @@
 %% MySQL/OTP – MySQL client library for Erlang/OTP
-%% Copyright (C) 2014 Viktor Söderqvist
+%% Copyright (C) 2014-2016 Viktor Söderqvist
+%%               2017 Piotr Nosek
 %%
 %% This file is part of MySQL/OTP.
 %%
@@ -21,8 +22,14 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
--define(user,     "otptest").
--define(password, "otptest").
+-define(user,         "otptest").
+-define(password,     "otptest").
+-define(ssl_user,     "otptestssl").
+-define(ssl_password, "otptestssl").
+
+%% We need to set a the SQL mode so it is consistent across MySQL versions
+%% and distributions.
+-define(SQL_MODE, <<"NO_ENGINE_SUBSTITUTION">>).
 
 -define(create_table_t, <<"CREATE TABLE t ("
                           "  id INT NOT NULL PRIMARY KEY AUTO_INCREMENT,"
@@ -45,26 +52,101 @@ failing_connect_test() ->
     receive
         {'EXIT', _Pid, {1045, <<"28000">>, <<"Access denie", _/binary>>}} -> ok
     after 1000 ->
-        ?assertEqual(ok, no_exit_message)
+        error(no_exit_message)
     end,
     process_flag(trap_exit, false).
 
 successful_connect_test() ->
     %% A connection with a registered name and execute initial queries and
     %% create prepared statements.
-    Options = [{name, {local, tardis}}, {user, ?user}, {password, ?password},
+    Pid = common_basic_check([{user, ?user}, {password, ?password}]),
+
+    %% Test some gen_server callbacks not tested elsewhere
+    State = get_state(Pid),
+    ?assertMatch({ok, State}, mysql_conn:code_change("0.1.0", State, [])),
+    ?assertMatch({error, _}, mysql_conn:code_change("2.0.0", unknown_state, [])),
+    common_conn_close().
+
+common_basic_check(ExtraOpts) ->
+    Options = [{name, {local, tardis}},
                {queries, ["SET @foo = 'bar'", "SELECT 1",
                           "SELECT 1; SELECT 2"]},
-               {prepare, [{foo, "SELECT @foo"}]}],
+               {prepare, [{foo, "SELECT @foo"}]} | ExtraOpts],
     {ok, Pid} = mysql:start_link(Options),
     %% Check that queries and prepare has been done.
     ?assertEqual({ok, [<<"@foo">>], [[<<"bar">>]]},
                  mysql:execute(Pid, foo, [])),
-    %% Test some gen_server callbacks not tested elsewhere
-    State = get_state(Pid),
-    ?assertMatch({ok, State}, mysql:code_change("0.1.0", State, [])),
-    ?assertMatch({error, _}, mysql:code_change("2.0.0", unknown_state, [])),
-    exit(whereis(tardis), normal).
+    Pid.
+
+common_conn_close() ->
+    Pid = whereis(tardis),
+    process_flag(trap_exit, true),
+    exit(Pid, normal),
+    receive
+        {'EXIT', Pid, normal} -> ok
+    after
+        5000 -> error({cant_stop_connection, Pid})
+    end,
+    process_flag(trap_exit, false).
+
+exit_normal_test() ->
+    Options = [{user, ?user}, {password, ?password}],
+    {ok, Pid} = mysql:start_link(Options),
+    {ok, ok, LoggedErrors} = error_logger_acc:capture(fun () ->
+        %% Stop the connection without noise, errors or messages
+        exit(Pid, normal),
+        receive
+            UnexpectedExitMessage -> UnexpectedExitMessage
+        after 50 ->
+            ok
+        end
+    end),
+    %% Check that we got nothing in the error log.
+    ?assertEqual([], LoggedErrors).
+
+server_disconnect_test() ->
+    process_flag(trap_exit, true),
+    Options = [{user, ?user}, {password, ?password}],
+    {ok, Pid} = mysql:start_link(Options),
+    {ok, ok, LoggedErrors} = error_logger_acc:capture(fun () ->
+        %% Make the server close the connection after 1 second of inactivity.
+        ok = mysql:query(Pid, <<"SET SESSION wait_timeout = 1">>),
+        receive
+            {'EXIT', Pid, tcp_closed} -> ok
+        after 2000 ->
+            no_exit_message
+        end
+    end),
+    process_flag(trap_exit, false),
+    %% Check that we got the expected errors in the error log.
+    [{error, Msg1}, {error, Msg2}, {error_report, CrashReport}] = LoggedErrors,
+    %% "Connection Id 24 closing with reason: tcp_closed"
+    ?assert(lists:prefix("Connection Id", Msg1)),
+    ExpectedPrefix = io_lib:format("** Generic server ~p terminating", [Pid]),
+    ?assert(lists:prefix(lists:flatten(ExpectedPrefix), Msg2)),
+    ?assertMatch({crash_report, _}, CrashReport).
+
+tcp_error_test() ->
+    process_flag(trap_exit, true),
+    Options = [{user, ?user}, {password, ?password}],
+    {ok, Pid} = mysql:start_link(Options),
+    {ok, ok, LoggedErrors} = error_logger_acc:capture(fun () ->
+        %% Simulate a tcp error by sending a message. (Is there a better way?)
+        Pid ! {tcp_error, dummy_socket, tcp_reason},
+        receive
+            {'EXIT', Pid, {tcp_error, tcp_reason}} -> ok
+        after 1000 ->
+            error(no_exit_message)
+        end
+    end),
+    process_flag(trap_exit, false),
+    %% Check that we got the expected crash report in the error log.
+    [{error, Msg1}, {error, Msg2}, {error_report, CrashReport}] = LoggedErrors,
+    %% "Connection Id 24 closing with reason: tcp_closed"
+    ?assert(lists:prefix("Connection Id", Msg1)),
+    ExpectedPrefix = io_lib:format("** Generic server ~p terminating", [Pid]),
+    ?assert(lists:prefix(lists:flatten(ExpectedPrefix), Msg2)),
+    ?assertMatch({crash_report, _}, CrashReport).
 
 keep_alive_test() ->
      %% Let the connection send a few pings.
@@ -106,6 +188,7 @@ query_test_() ->
          ok = mysql:query(Pid, <<"CREATE DATABASE otptest">>),
          ok = mysql:query(Pid, <<"USE otptest">>),
          ok = mysql:query(Pid, <<"SET autocommit = 1">>),
+         ok = mysql:query(Pid, <<"SET SESSION sql_mode = ?">>, [?SQL_MODE]),
          Pid
      end,
      fun (Pid) ->
@@ -117,6 +200,7 @@ query_test_() ->
           {"Autocommit",           fun () -> autocommit(Pid) end},
           {"Encode",               fun () -> encode(Pid) end},
           {"Basic queries",        fun () -> basic_queries(Pid) end},
+          {"FOUND_ROWS option",    fun () -> found_rows(Pid) end},
           {"Multi statements",     fun () -> multi_statements(Pid) end},
           {"Text protocol",        fun () -> text_protocol(Pid) end},
           {"Binary protocol",      fun () -> binary_protocol(Pid) end},
@@ -127,6 +211,7 @@ query_test_() ->
           {"DATE",                 fun () -> date(Pid) end},
           {"TIME",                 fun () -> time(Pid) end},
           {"DATETIME",             fun () -> datetime(Pid) end},
+          {"JSON",                 fun () -> json(Pid) end},
           {"Microseconds",         fun () -> microseconds(Pid) end}]
      end}.
 
@@ -142,6 +227,7 @@ log_warnings_test() ->
     {ok, Pid} = mysql:start_link([{user, ?user}, {password, ?password}]),
     ok = mysql:query(Pid, <<"CREATE DATABASE otptest">>),
     ok = mysql:query(Pid, <<"USE otptest">>),
+    ok = mysql:query(Pid, <<"SET SESSION sql_mode = ?">>, [?SQL_MODE]),
     %% Capture error log to check that we get a warning logged
     ok = mysql:query(Pid, "CREATE TABLE foo (x INT NOT NULL)"),
     {ok, insrt} = mysql:prepare(Pid, insrt, "INSERT INTO foo () VALUES ()"),
@@ -192,6 +278,26 @@ basic_queries(Pid) ->
                  mysql:query(Pid, <<"SELECT 42 AS i, 'foo' AS s;">>)),
 
     ok.
+
+found_rows(Pid) ->
+    Options = [{user, ?user}, {password, ?password}, {log_warnings, false},
+               {keep_alive, true}, {found_rows, true}],
+    {ok, FRPid} = mysql:start_link(Options),
+    ok = mysql:query(FRPid, <<"USE otptest">>),
+
+    ok = mysql:query(Pid, ?create_table_t),
+    ok = mysql:query(Pid, <<"INSERT INTO t (id, tx) VALUES (1, 'text')">>),
+
+    %% With no found_rows option, affected_rows for update returns 0
+    ok = mysql:query(Pid, <<"UPDATE t SET tx = 'text' WHERE id = 1">>),
+    ?assertEqual(0, mysql:affected_rows(Pid)),
+
+    %% With found_rows, affected_rows returns the number of rows found
+    ok = mysql:query(FRPid, <<"UPDATE t SET tx = 'text' WHERE id = 1">>),
+    ?assertEqual(1, mysql:affected_rows(FRPid)),
+
+    ok = mysql:query(Pid, <<"DROP TABLE t">>).
+
 
 multi_statements(Pid) ->
     %% Multiple statements, no result set
@@ -258,7 +364,7 @@ binary_protocol(Pid) ->
                                      " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)">>),
     %% 16#161 is the codepoint for "s with caron"; <<197, 161>> in UTF-8.
     ok = mysql:execute(Pid, Ins, [<<"blob">>, [16#161], 3.14, 3.14, 3.14,
-                                  2014, {0, {0, 22, 11}}, 
+                                  2014, {0, {0, 22, 11}},
                                   {{2014, 11, 03}, {0, 22, 24}},
                                   {2014, 11, 03}, null]),
 
@@ -368,18 +474,44 @@ int(Pid) ->
     write_read_text_binary(Pid, 127, <<"1000">>, <<"tint">>, <<"i">>),
     write_read_text_binary(Pid, -128, <<"-1000">>, <<"tint">>, <<"i">>),
     ok = mysql:query(Pid, "DROP TABLE tint"),
+    %% TINYINT UNSIGNED
+    ok = mysql:query(Pid, "CREATE TABLE tuint (i TINYINT UNSIGNED)"),
+    write_read_text_binary(Pid, 240, <<"240">>, <<"tuint">>, <<"i">>),
+    ok = mysql:query(Pid, "DROP TABLE tuint"),
     %% SMALLINT
     ok = mysql:query(Pid, "CREATE TABLE sint (i SMALLINT)"),
     write_read_text_binary(Pid, 32000, <<"32000">>, <<"sint">>, <<"i">>),
     write_read_text_binary(Pid, -32000, <<"-32000">>, <<"sint">>, <<"i">>),
     ok = mysql:query(Pid, "DROP TABLE sint"),
+    %% SMALLINT UNSIGNED
+    ok = mysql:query(Pid, "CREATE TABLE suint (i SMALLINT UNSIGNED)"),
+    write_read_text_binary(Pid, 64000, <<"64000">>, <<"suint">>, <<"i">>),
+    ok = mysql:query(Pid, "DROP TABLE suint"),
+    %% MEDIUMINT
+    ok = mysql:query(Pid, "CREATE TABLE mint (i MEDIUMINT)"),
+    write_read_text_binary(Pid, 8388000, <<"8388000">>,
+                           <<"mint">>, <<"i">>),
+    write_read_text_binary(Pid, -8388000, <<"-8388000">>,
+                           <<"mint">>, <<"i">>),
+    ok = mysql:query(Pid, "DROP TABLE mint"),
+    %% MEDIUMINT UNSIGNED
+    ok = mysql:query(Pid, "CREATE TABLE muint (i MEDIUMINT UNSIGNED)"),
+    write_read_text_binary(Pid, 16777000, <<"16777000">>,
+                           <<"muint">>, <<"i">>),
+    ok = mysql:query(Pid, "DROP TABLE muint"),
     %% BIGINT
     ok = mysql:query(Pid, "CREATE TABLE bint (i BIGINT)"),
     write_read_text_binary(Pid, 123456789012, <<"123456789012">>,
                            <<"bint">>, <<"i">>),
     write_read_text_binary(Pid, -123456789012, <<"-123456789012">>,
                            <<"bint">>, <<"i">>),
-    ok = mysql:query(Pid, "DROP TABLE bint").
+    ok = mysql:query(Pid, "DROP TABLE bint"),
+    %% BIGINT UNSIGNED
+    ok = mysql:query(Pid, "CREATE TABLE buint (i BIGINT UNSIGNED)"),
+    write_read_text_binary(Pid, 18446744073709551000,
+                           <<"18446744073709551000">>,
+                           <<"buint">>, <<"i">>),
+    ok = mysql:query(Pid, "DROP TABLE buint").
 
 %% The BIT(N) datatype in MySQL 5.0.3 and later: the equivallent to bitstring()
 bit(Pid) ->
@@ -436,15 +568,48 @@ datetime(Pid) ->
     ),
     ok = mysql:query(Pid, "DROP TABLE dt").
 
+json(Pid) ->
+    Version = db_version_string(Pid),
+    try
+        is_mariadb(Version) andalso throw(no_mariadb),
+        Version1 = parse_db_version(Version),
+        Version1 >= [5, 7, 8] orelse throw(version_too_small)
+    of _ ->
+        test_valid_json(Pid),
+        test_invalid_json(Pid)
+    catch
+        throw:no_mariadb ->
+            error_logger:info_msg("Skipping JSON test, not supported on"
+                                  " MariaDB.~n");
+        throw:version_too_small ->
+            error_logger:info_msg("Skipping JSON test. Current MySQL version"
+                                  " is ~s. Required version is >= 5.7.8.~n",
+                                  [Version])
+    end.
+
+test_valid_json(Pid) ->
+    ok = mysql:query(Pid, "CREATE TABLE json_t (json_c JSON)"),
+    Value = <<"'{\"a\": 1, \"b\": {\"c\": [1, 2, 3, 4]}}'">>,
+    Expected = <<"{\"a\": 1, \"b\": {\"c\": [1, 2, 3, 4]}}">>,
+    write_read_text_binary(Pid, Expected, Value,
+                           <<"json_t">>, <<"json_c">>),
+    ok = mysql:query(Pid, "DROP TABLE json_t").
+
+test_invalid_json(Pid) ->
+    ok = mysql:query(Pid, "CREATE TABLE json_t (json_c JSON)"),
+    InvalidJson = <<"'{\"a\": \"c\": 2}'">>,
+    ?assertMatch({error,{3140, <<"22032">>, _}},
+                 mysql:query(Pid, <<"INSERT INTO json_t (json_c)"
+                                    " VALUES (", InvalidJson/binary,
+                                    ")">>)),
+    ok = mysql:query(Pid, "DROP TABLE json_t").
+
 microseconds(Pid) ->
     %% Check whether we have the required version for this testcase.
-    {ok, _, [[Version]]} = mysql:query(Pid, <<"SELECT @@version">>),
+    Version = db_version_string(Pid),
     try
-        %% Remove stuff after dash for e.g. "5.5.40-0ubuntu0.12.04.1-log"
-        [Version1 | _] = binary:split(Version, <<"-">>),
-        Version2 = lists:map(fun binary_to_integer/1,
-                             binary:split(Version1, <<".">>, [global])),
-        Version2 >= [5, 6, 4] orelse throw(nope)
+        Version1 = parse_db_version(Version),
+        Version1 >= [5, 6, 4] orelse throw(nope)
     of _ ->
         test_time_microseconds(Pid),
         test_datetime_microseconds(Pid)
@@ -481,7 +646,8 @@ write_read_text_binary(Conn, Term, SqlLiteral, Table, Column) ->
     InsertQuery = <<"INSERT INTO ", Table/binary, " (", Column/binary, ")"
                     " VALUES (", SqlLiteral/binary, ")">>,
     ok = mysql:query(Conn, InsertQuery),
-    ?assertEqual({ok, [Column], [[Term]]}, mysql:query(Conn, SelectQuery)),
+    R = mysql:query(Conn, SelectQuery),
+    ?assertEqual({ok, [Column], [[Term]]}, R),
     ?assertEqual({ok, [Column], [[Term]]}, mysql:execute(Conn, SelectStmt, [])),
     mysql:query(Conn, <<"DELETE FROM ", Table/binary>>),
 
@@ -592,6 +758,20 @@ parameterized_query(Conn) ->
 %% --- simple gen_server callbacks ---
 
 gen_server_coverage_test() ->
-    {noreply, state} = mysql:handle_cast(foo, state),
-    {noreply, state} = mysql:handle_info(foo, state),
-    ok = mysql:terminate(kill, state).
+    {noreply, state} = mysql_conn:handle_cast(foo, state),
+    {noreply, state} = mysql_conn:handle_info(foo, state),
+    ok = mysql_conn:terminate(kill, state).
+
+%% --- Utility functions
+db_version_string(Pid) ->
+  {ok, _, [[Version]]} = mysql:query(Pid, <<"SELECT @@version">>),
+  Version.
+
+is_mariadb(Version) ->
+    binary:match(Version, <<"MariaDB">>) =/= nomatch.
+
+parse_db_version(Version) ->
+  %% Remove stuff after dash for e.g. "5.5.40-0ubuntu0.12.04.1-log"
+  [Version1 | _] = binary:split(Version, <<"-">>),
+  lists:map(fun binary_to_integer/1,
+            binary:split(Version1, <<".">>, [global])).

@@ -1,3 +1,4 @@
+.erlang.mk
 .eunit
 deps
 *.o
@@ -16,3 +17,8 @@ cover
 *.coverdata
 tests.output
 test/ct.cover.spec
+test/ssl/ca*
+test/ssl/server*
+test/ssl/my-ssl.cnf
+test/ssl/my-ssl.cnf-e
+mysql.d

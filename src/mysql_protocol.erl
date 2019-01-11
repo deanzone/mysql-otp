@@ -1,5 +1,6 @@
 %% MySQL/OTP – MySQL client library for Erlang/OTP
 %% Copyright (C) 2014 Viktor Söderqvist
+%%               2017 Piotr Nosek, Michal Slaski
 %%
 %% This file is part of MySQL/OTP.
 %%
@@ -26,7 +27,7 @@
 %% @private
 -module(mysql_protocol).
 
--export([handshake/5, quit/2, ping/2,
+-export([handshake/7, quit/2, ping/2,
          query/4, fetch_query_response/3,
          prepare/3, unprepare/3, execute/5, fetch_execute_response/3]).
 
@@ -42,60 +43,92 @@
 -define(error_pattern, <<?ERROR, _/binary>>).
 -define(eof_pattern, <<?EOF, _:4/binary>>).
 
-%% @doc Performs a handshake using the supplied functions for communication.
-%% Returns an ok or an error record. Raises errors when various unimplemented
-%% features are requested.
--spec handshake(iodata(), iodata(), iodata() | undefined, atom(), term()) ->
-    #handshake{} | #error{}.
-handshake(Username, Password, Database, TcpModule, Socket) ->
+%% @doc Performs a handshake using the supplied socket and socket module for
+%% communication. Returns an ok or an error record. Raises errors when various
+%% unimplemented features are requested.
+-spec handshake(Username :: iodata(), Password :: iodata(),
+                Database :: iodata() | undefined,
+                SockModule :: module(), SSLOpts :: list() | undefined,
+                Socket :: term(),
+                SetFoundRows :: boolean()) ->
+    {ok, #handshake{}, SockModule :: module(), Socket :: term()} |
+    #error{}.
+handshake(Username, Password, Database, SockModule0, SSLOpts, Socket0,
+          SetFoundRows) ->
     SeqNum0 = 0,
-    {ok, HandshakePacket, SeqNum1} = recv_packet(TcpModule, Socket, SeqNum0),
-    Handshake = parse_handshake(HandshakePacket),
-    Response = build_handshake_response(Handshake, Username, Password,
-                                        Database),
-    {ok, SeqNum2} = send_packet(TcpModule, Socket, Response, SeqNum1),
-    {ok, ConfirmPacket, _SeqNum3} = recv_packet(TcpModule, Socket, SeqNum2),
+    {ok, HandshakePacket, SeqNum1} = recv_packet(SockModule0, Socket0, SeqNum0),
+    case parse_handshake(HandshakePacket) of
+        #handshake{} = Handshake ->
+            {ok, SockModule, Socket, SeqNum2} =
+                maybe_do_ssl_upgrade(SockModule0, Socket0, SeqNum1, Handshake,
+                                     SSLOpts, Database, SetFoundRows),
+            Response = build_handshake_response(Handshake, Username, Password,
+                                                Database, SetFoundRows),
+            {ok, SeqNum3} = send_packet(SockModule, Socket, Response, SeqNum2),
+            handshake_finish_or_switch_auth(Handshake, Password, SockModule,
+                                            Socket, SeqNum3);
+        #error{} = Error ->
+            Error
+    end.
+
+handshake_finish_or_switch_auth(Handshake = #handshake{status = Status}, Password,
+                                SockModule, Socket, SeqNum0) ->
+    {ok, ConfirmPacket, SeqNum1} = recv_packet(SockModule, Socket, SeqNum0),
     case parse_handshake_confirm(ConfirmPacket) of
         #ok{status = OkStatus} ->
-            OkStatus = Handshake#handshake.status,
-            Handshake;
+            %% check status, ignoring bit 16#4000, SERVER_SESSION_STATE_CHANGED.
+            Status = OkStatus band bnot 16#4000,
+            {ok, Handshake, SockModule, Socket};
+        #auth_method_switch{auth_plugin_name = AuthPluginName,
+                            auth_plugin_data = AuthPluginData} ->
+            Hash = case AuthPluginName of
+                       <<>> ->
+                           hash_password(Password, AuthPluginData);
+                       <<"mysql_native_password">> ->
+                           hash_password(Password, AuthPluginData);
+                       UnknownAuthMethod ->
+                           error({auth_method, UnknownAuthMethod})
+                   end,
+            {ok, SeqNum2} = send_packet(SockModule, Socket, Hash, SeqNum1),
+            handshake_finish_or_switch_auth(Handshake, Password, SockModule,
+                                            Socket, SeqNum2);
         Error ->
             Error
     end.
 
 -spec quit(atom(), term()) -> ok.
-quit(TcpModule, Socket) ->
-    {ok, SeqNum1} = send_packet(TcpModule, Socket, <<?COM_QUIT>>, 0),
-    case recv_packet(TcpModule, Socket, SeqNum1) of
+quit(SockModule, Socket) ->
+    {ok, SeqNum1} = send_packet(SockModule, Socket, <<?COM_QUIT>>, 0),
+    case recv_packet(SockModule, Socket, SeqNum1) of
         {error, closed} -> ok;            %% MySQL 5.5.40 and more
         {ok, ?ok_pattern, _SeqNum2} -> ok %% Some older MySQL versions?
     end.
 
 -spec ping(atom(), term()) -> #ok{}.
-ping(TcpModule, Socket) ->
-    {ok, SeqNum1} = send_packet(TcpModule, Socket, <<?COM_PING>>, 0),
-    {ok, OkPacket, _SeqNum2} = recv_packet(TcpModule, Socket, SeqNum1),
+ping(SockModule, Socket) ->
+    {ok, SeqNum1} = send_packet(SockModule, Socket, <<?COM_PING>>, 0),
+    {ok, OkPacket, _SeqNum2} = recv_packet(SockModule, Socket, SeqNum1),
     parse_ok_packet(OkPacket).
 
 -spec query(Query :: iodata(), atom(), term(), timeout()) ->
     {ok, [#ok{} | #resultset{} | #error{}]} | {error, timeout}.
-query(Query, TcpModule, Socket, Timeout) ->
+query(Query, SockModule, Socket, Timeout) ->
     Req = <<?COM_QUERY, (iolist_to_binary(Query))/binary>>,
     SeqNum0 = 0,
-    {ok, _SeqNum1} = send_packet(TcpModule, Socket, Req, SeqNum0),
-    fetch_query_response(TcpModule, Socket, Timeout).
+    {ok, _SeqNum1} = send_packet(SockModule, Socket, Req, SeqNum0),
+    fetch_query_response(SockModule, Socket, Timeout).
 
 %% @doc This is used by query/4. If query/4 returns {error, timeout}, this
-%% function can be called to retry to fetch the results of the query. 
-fetch_query_response(TcpModule, Socket, Timeout) ->
-    fetch_response(TcpModule, Socket, Timeout, text, []).
+%% function can be called to retry to fetch the results of the query.
+fetch_query_response(SockModule, Socket, Timeout) ->
+    fetch_response(SockModule, Socket, Timeout, text, []).
 
 %% @doc Prepares a statement.
 -spec prepare(iodata(), atom(), term()) -> #error{} | #prepared{}.
-prepare(Query, TcpModule, Socket) ->
+prepare(Query, SockModule, Socket) ->
     Req = <<?COM_STMT_PREPARE, (iolist_to_binary(Query))/binary>>,
-    {ok, SeqNum1} = send_packet(TcpModule, Socket, Req, 0),
-    {ok, Resp, SeqNum2} = recv_packet(TcpModule, Socket, SeqNum1),
+    {ok, SeqNum1} = send_packet(SockModule, Socket, Req, 0),
+    {ok, Resp, SeqNum2} = recv_packet(SockModule, Socket, SeqNum1),
     case Resp of
         ?error_pattern ->
             parse_error_packet(Resp);
@@ -111,13 +144,13 @@ prepare(Query, TcpModule, Socket) ->
             %% with charset 'binary' so we have to select a type ourselves for
             %% the parameters we have in execute/4.
             {_ParamDefs, SeqNum3} =
-                fetch_column_definitions_if_any(NumParams, TcpModule, Socket,
+                fetch_column_definitions_if_any(NumParams, SockModule, Socket,
                                                 SeqNum2),
             %% Column Definition Block. We get column definitions in execute
             %% too, so we don't need them here. We *could* store them to be able
             %% to provide the user with some info about a prepared statement.
             {_ColDefs, _SeqNum4} =
-                fetch_column_definitions_if_any(NumColumns, TcpModule, Socket,
+                fetch_column_definitions_if_any(NumColumns, SockModule, Socket,
                                                 SeqNum3),
             #prepared{statement_id = StmtId,
                       orig_query = Query,
@@ -127,8 +160,8 @@ prepare(Query, TcpModule, Socket) ->
 
 %% @doc Deallocates a prepared statement.
 -spec unprepare(#prepared{}, atom(), term()) -> ok.
-unprepare(#prepared{statement_id = Id}, TcpModule, Socket) ->
-    {ok, _SeqNum} = send_packet(TcpModule, Socket,
+unprepare(#prepared{statement_id = Id}, SockModule, Socket) ->
+    {ok, _SeqNum} = send_packet(SockModule, Socket,
                                 <<?COM_STMT_CLOSE, Id:32/little>>, 0),
     ok.
 
@@ -136,7 +169,7 @@ unprepare(#prepared{statement_id = Id}, TcpModule, Socket) ->
 -spec execute(#prepared{}, [term()], atom(), term(), timeout()) ->
     {ok, [#ok{} | #resultset{} | #error{}]} | {error, timeout}.
 execute(#prepared{statement_id = Id, param_count = ParamCount}, ParamValues,
-        TcpModule, Socket, Timeout) when ParamCount == length(ParamValues) ->
+        SockModule, Socket, Timeout) when ParamCount == length(ParamValues) ->
     %% Flags Constant Name
     %% 0x00 CURSOR_TYPE_NO_CURSOR
     %% 0x01 CURSOR_TYPE_READ_ONLY
@@ -162,20 +195,20 @@ execute(#prepared{statement_id = Id, param_count = ParamCount}, ParamValues,
             {TypesAndSigns, EncValues} = lists:unzip(EncodedParams),
             iolist_to_binary([Req1, TypesAndSigns, EncValues])
     end,
-    {ok, _SeqNum1} = send_packet(TcpModule, Socket, Req, 0),
-    fetch_execute_response(TcpModule, Socket, Timeout).
+    {ok, _SeqNum1} = send_packet(SockModule, Socket, Req, 0),
+    fetch_execute_response(SockModule, Socket, Timeout).
 
 %% @doc This is used by execute/5. If execute/5 returns {error, timeout}, this
 %% function can be called to retry to fetch the results of the query.
-fetch_execute_response(TcpModule, Socket, Timeout) ->
-    fetch_response(TcpModule, Socket, Timeout, binary, []).
+fetch_execute_response(SockModule, Socket, Timeout) ->
+    fetch_response(SockModule, Socket, Timeout, binary, []).
 
 %% --- internal ---
 
 %% @doc Parses a handshake. This is the first thing that comes from the server
 %% when connecting. If an unsupported version or variant of the protocol is used
 %% an error is raised.
--spec parse_handshake(binary()) -> #handshake{}.
+-spec parse_handshake(binary()) -> #handshake{} | #error{}.
 parse_handshake(<<10, Rest/binary>>) ->
     %% Protocol version 10.
     {ServerVersion, Rest1} = nulterm_str(Rest),
@@ -212,6 +245,10 @@ parse_handshake(<<10, Rest/binary>>) ->
                status = StatusFlags,
                auth_plugin_data = AuthPluginData,
                auth_plugin_name = AuthPluginName1};
+parse_handshake(<<?ERROR, ErrNo:16/little, Msg/binary>>) ->
+    %% 'Too many connections' in MariaDB 10.1.21
+    %% (Error packet in pre-4.1 protocol)
+    #error{code = ErrNo, msg = Msg};
 parse_handshake(<<Protocol:8, _/binary>>) when Protocol /= 10 ->
     error(unknown_protocol).
 
@@ -223,28 +260,72 @@ server_version_to_list(ServerVersion) ->
                             [{capture, all_but_first, binary}]),
     lists:map(fun binary_to_integer/1, Parts).
 
+-spec maybe_do_ssl_upgrade(SockModule0 :: module(),
+                           Socket0 :: term(),
+                           SeqNum1 :: non_neg_integer(),
+                           Handshake :: #handshake{},
+                           SSLOpts :: undefined | list(),
+                           Database :: iodata() | undefined,
+                           SetFoundRows :: boolean()) ->
+    {ok, SockModule :: module(), Socket :: term(),
+     SeqNum2 :: non_neg_integer()}.
+maybe_do_ssl_upgrade(SockModule0, Socket0, SeqNum1, _Handshake, undefined,
+                     _Database, _SetFoundRows) ->
+    {ok, SockModule0, Socket0, SeqNum1};
+maybe_do_ssl_upgrade(gen_tcp, Socket0, SeqNum1, Handshake, SSLOpts,
+                     Database, SetFoundRows) ->
+    Response = build_handshake_response(Handshake, Database, SetFoundRows),
+    {ok, SeqNum2} = send_packet(gen_tcp, Socket0, Response, SeqNum1),
+    case ssl_connect(Socket0, SSLOpts, 5000) of
+        {ok, SSLSocket} ->
+            {ok, ssl, SSLSocket, SeqNum2};
+        {error, Reason} ->
+            exit({failed_to_upgrade_socket, Reason})
+    end.
+
+ssl_connect(Port, ConfigSSLOpts, Timeout) ->
+    DefaultSSLOpts = [{versions, [tlsv1]}, {verify, verify_peer}],
+    MandatorySSLOpts = [{active, false}],
+    MergedSSLOpts = merge_ssl_options(DefaultSSLOpts, MandatorySSLOpts, ConfigSSLOpts),
+    ssl:connect(Port, MergedSSLOpts, Timeout).
+
+-spec merge_ssl_options(list(), list(), list()) -> list().
+merge_ssl_options(DefaultSSLOpts, MandatorySSLOpts, ConfigSSLOpts) ->
+    SSLOpts1 =
+    lists:foldl(fun({Key, _} = Opt, OptsAcc) ->
+                        lists:keystore(Key, 1, OptsAcc, Opt)
+                end, DefaultSSLOpts, ConfigSSLOpts),
+    lists:foldl(fun({Key, _} = Opt, OptsAcc) ->
+                        lists:keystore(Key, 1, OptsAcc, Opt)
+                end, SSLOpts1, MandatorySSLOpts).
+
+%% @doc This function is used when upgrading to encrypted socket. In other,
+%% cases, build_handshake_response/5 is used.
+-spec build_handshake_response(#handshake{}, iodata() | undefined, boolean()) ->
+    binary().
+build_handshake_response(Handshake, Database, SetFoundRows) ->
+    CapabilityFlags = basic_capabilities(Database /= undefined, SetFoundRows),
+    verify_server_capabilities(Handshake, CapabilityFlags),
+    ClientCapabilities = add_client_capabilities(CapabilityFlags),
+    ClientSSLCapabilities = ClientCapabilities bor ?CLIENT_SSL,
+    CharacterSet = ?UTF8,
+    <<ClientSSLCapabilities:32/little,
+      ?MAX_BYTES_PER_PACKET:32/little,
+      CharacterSet:8,
+      0:23/unit:8>>.
+
 %% @doc The response sent by the client to the server after receiving the
 %% initial handshake from the server
 -spec build_handshake_response(#handshake{}, iodata(), iodata(),
-                               iodata() | undefined) -> binary().
-build_handshake_response(Handshake, Username, Password, Database) ->
-    %% We require these capabilities. Make sure the server handles them.
-    CapabilityFlags0 = ?CLIENT_PROTOCOL_41 bor
-                       ?CLIENT_TRANSACTIONS bor
-                       ?CLIENT_SECURE_CONNECTION,
-    CapabilityFlags = case Database of
-        undefined -> CapabilityFlags0;
-        _         -> CapabilityFlags0 bor ?CLIENT_CONNECT_WITH_DB
-    end,
-    Handshake#handshake.capabilities band CapabilityFlags == CapabilityFlags
-        orelse error(old_server_version),
+                               iodata() | undefined, boolean()) -> binary().
+build_handshake_response(Handshake, Username, Password, Database,
+                         SetFoundRows) ->
+    CapabilityFlags = basic_capabilities(Database /= undefined, SetFoundRows),
+    verify_server_capabilities(Handshake, CapabilityFlags),
     %% Add some extra capability flags only for signalling to the server what
     %% the client wants to do. The server doesn't say it handles them although
     %% it does. (http://bugs.mysql.com/bug.php?id=42268)
-    ClientCapabilityFlags = CapabilityFlags bor
-                            ?CLIENT_MULTI_STATEMENTS bor
-                            ?CLIENT_MULTI_RESULTS bor
-                            ?CLIENT_PS_MULTI_RESULTS,
+    ClientCapabilityFlags = add_client_capabilities(CapabilityFlags),
     Hash = case Handshake#handshake.auth_plugin_name of
         <<>> ->
             %% Server doesn't know auth plugins
@@ -271,10 +352,41 @@ build_handshake_response(Handshake, Username, Password, Database) ->
       Hash/binary,
       DbBin/binary>>.
 
+-spec verify_server_capabilities(Handshake :: #handshake{},
+                                 CapabilityFlags :: integer()) ->
+    true | no_return().
+verify_server_capabilities(Handshake, CapabilityFlags) ->
+    %% We require these capabilities. Make sure the server handles them.
+    Handshake#handshake.capabilities band CapabilityFlags == CapabilityFlags
+        orelse error(old_server_version).
+
+-spec basic_capabilities(ConnectWithDB :: boolean(),
+                         SetFoundRows :: boolean()) -> integer().
+basic_capabilities(ConnectWithDB, SetFoundRows) ->
+    CapabilityFlags0 = ?CLIENT_PROTOCOL_41 bor
+                       ?CLIENT_TRANSACTIONS bor
+                       ?CLIENT_SECURE_CONNECTION,
+    CapabilityFlags1 = case ConnectWithDB of
+                           true -> CapabilityFlags0 bor ?CLIENT_CONNECT_WITH_DB;
+                           _ -> CapabilityFlags0
+                       end,
+    case SetFoundRows of
+        true -> CapabilityFlags1 bor ?CLIENT_FOUND_ROWS;
+        _    -> CapabilityFlags1
+    end.
+
+-spec add_client_capabilities(Caps :: integer()) -> integer().
+add_client_capabilities(Caps) ->
+    Caps bor
+    ?CLIENT_MULTI_STATEMENTS bor
+    ?CLIENT_MULTI_RESULTS bor
+    ?CLIENT_PS_MULTI_RESULTS.
+
 %% @doc Handles the second packet from the server, when we have replied to the
 %% initial handshake. Returns an error if the server returns an error. Raises
 %% an error if unimplemented features are required.
--spec parse_handshake_confirm(binary()) -> #ok{} | #error{}.
+-spec parse_handshake_confirm(binary()) -> #ok{} | #auth_method_switch{} |
+                                           #error{}.
 parse_handshake_confirm(Packet) ->
     case Packet of
         ?ok_pattern ->
@@ -289,11 +401,11 @@ parse_handshake_confirm(Packet) ->
             %% switch to Old Password Authentication if CLIENT_PLUGIN_AUTH
             %% capability is not supported (by either the client or the server)"
             error(old_auth);
-        <<?EOF, _/binary>> ->
+        <<?EOF, AuthMethodSwitch/binary>> ->
             %% "Authentication Method Switch Request Packet. If both server and
             %% client support CLIENT_PLUGIN_AUTH capability, server can send
             %% this packet to ask client to use another authentication method."
-            error(auth_method_switch)
+            parse_auth_method_switch(AuthMethodSwitch)
     end.
 
 %% -- both text and binary protocol --
@@ -303,8 +415,8 @@ parse_handshake_confirm(Packet) ->
 %% prepared statements).
 -spec fetch_response(atom(), term(), timeout(), text | binary, list()) ->
     {ok, [#ok{} | #resultset{} | #error{}]} | {error, timeout}.
-fetch_response(TcpModule, Socket, Timeout, Proto, Acc) ->
-    case recv_packet(TcpModule, Socket, Timeout, any) of
+fetch_response(SockModule, Socket, Timeout, Proto, Acc) ->
+    case recv_packet(SockModule, Socket, Timeout, any) of
         {ok, Packet, SeqNum2} ->
             Result = case Packet of
                 ?ok_pattern ->
@@ -314,7 +426,7 @@ fetch_response(TcpModule, Socket, Timeout, Proto, Acc) ->
                 ResultPacket ->
                     %% The first packet in a resultset is only the column count.
                     {ColCount, <<>>} = lenenc_int(ResultPacket),
-                    R0 = fetch_resultset(TcpModule, Socket, ColCount, SeqNum2),
+                    R0 = fetch_resultset(SockModule, Socket, ColCount, SeqNum2),
                     case R0 of
                         #error{} = E ->
                             %% TODO: Find a way to get here + testcase
@@ -326,7 +438,7 @@ fetch_response(TcpModule, Socket, Timeout, Proto, Acc) ->
             Acc1 = [Result | Acc],
             case more_results_exists(Result) of
                 true ->
-                    fetch_response(TcpModule, Socket, Timeout, Proto, Acc1);
+                    fetch_response(SockModule, Socket, Timeout, Proto, Acc1);
                 false ->
                     {ok, lists:reverse(Acc1)}
             end;
@@ -340,12 +452,12 @@ fetch_response(TcpModule, Socket, Timeout, Proto, Acc) ->
 %% be parsed.
 -spec fetch_resultset(atom(), term(), integer(), integer()) ->
     #resultset{} | #error{}.
-fetch_resultset(TcpModule, Socket, FieldCount, SeqNum) ->
-    {ok, ColDefs, SeqNum1} = fetch_column_definitions(TcpModule, Socket, SeqNum,
-                                                      FieldCount, []),
-    {ok, DelimiterPacket, SeqNum2} = recv_packet(TcpModule, Socket, SeqNum1),
+fetch_resultset(SockModule, Socket, FieldCount, SeqNum) ->
+    {ok, ColDefs, SeqNum1} = fetch_column_definitions(SockModule, Socket,
+                                                      SeqNum, FieldCount, []),
+    {ok, DelimiterPacket, SeqNum2} = recv_packet(SockModule, Socket, SeqNum1),
     #eof{status = S, warning_count = W} = parse_eof_packet(DelimiterPacket),
-    case fetch_resultset_rows(TcpModule, Socket, SeqNum2, []) of
+    case fetch_resultset_rows(SockModule, Socket, SeqNum2, []) of
         {ok, Rows, _SeqNum3} ->
             ColDefs1 = lists:map(fun parse_column_definition/1, ColDefs),
             #resultset{cols = ColDefs1, rows = Rows,
@@ -354,11 +466,13 @@ fetch_resultset(TcpModule, Socket, FieldCount, SeqNum) ->
             E
     end.
 
-parse_resultset(#resultset{cols = ColDefs, rows = Rows} = R, ColumnCount, text) ->
+parse_resultset(#resultset{cols = ColDefs, rows = Rows} = R, ColumnCount,
+                text) ->
     %% Parse the rows according to the 'text protocol' representation.
     Rows1 = [decode_text_row(ColumnCount, ColDefs, Row) || Row <- Rows],
     R#resultset{rows = Rows1};
-parse_resultset(#resultset{cols = ColDefs, rows = Rows} = R, ColumnCount, binary) ->
+parse_resultset(#resultset{cols = ColDefs, rows = Rows} = R, ColumnCount,
+                binary) ->
     %% Parse the rows according to the 'binary protocol' representation.
     Rows1 = [decode_binary_row(ColumnCount, ColDefs, Row) || Row <- Rows],
     R#resultset{rows = Rows1}.
@@ -375,12 +489,12 @@ more_results_exists(#resultset{status = S}) ->
 -spec fetch_column_definitions(atom(), term(), SeqNum :: integer(),
                                NumLeft :: integer(), Acc :: [binary()]) ->
     {ok, ColDefPackets :: [binary()], NextSeqNum :: integer()}.
-fetch_column_definitions(TcpModule, Socket, SeqNum, NumLeft, Acc)
+fetch_column_definitions(SockModule, Socket, SeqNum, NumLeft, Acc)
   when NumLeft > 0 ->
-    {ok, Packet, SeqNum1} = recv_packet(TcpModule, Socket, SeqNum),
-    fetch_column_definitions(TcpModule, Socket, SeqNum1, NumLeft - 1,
+    {ok, Packet, SeqNum1} = recv_packet(SockModule, Socket, SeqNum),
+    fetch_column_definitions(SockModule, Socket, SeqNum1, NumLeft - 1,
                              [Packet | Acc]);
-fetch_column_definitions(_TcpModule, _Socket, SeqNum, 0, Acc) ->
+fetch_column_definitions(_SockModule, _Socket, SeqNum, 0, Acc) ->
     {ok, lists:reverse(Acc), SeqNum}.
 
 %% @doc Fetches rows in a result set. There is a packet per row. The row packets
@@ -390,23 +504,23 @@ fetch_column_definitions(_TcpModule, _Socket, SeqNum, 0, Acc) ->
     {ok, Rows, integer()} | #error{}
     when Acc :: [binary()],
          Rows :: [binary()].
-fetch_resultset_rows(TcpModule, Socket, SeqNum, Acc) ->
-    {ok, Packet, SeqNum1} = recv_packet(TcpModule, Socket, SeqNum),
+fetch_resultset_rows(SockModule, Socket, SeqNum, Acc) ->
+    {ok, Packet, SeqNum1} = recv_packet(SockModule, Socket, SeqNum),
     case Packet of
         ?error_pattern ->
             parse_error_packet(Packet);
         ?eof_pattern ->
             {ok, lists:reverse(Acc), SeqNum1};
         Row ->
-            fetch_resultset_rows(TcpModule, Socket, SeqNum1, [Row | Acc])
+            fetch_resultset_rows(SockModule, Socket, SeqNum1, [Row | Acc])
     end.
 
 %% Parses a packet containing a column definition (part of a result set)
 parse_column_definition(Data) ->
     {<<"def">>, Rest1} = lenenc_str(Data),   %% catalog (always "def")
-    {_Schema, Rest2} = lenenc_str(Rest1),    %% schema-name 
-    {_Table, Rest3} = lenenc_str(Rest2),     %% virtual table-name 
-    {_OrgTable, Rest4} = lenenc_str(Rest3),  %% physical table-name 
+    {_Schema, Rest2} = lenenc_str(Rest1),    %% schema-name
+    {_Table, Rest3} = lenenc_str(Rest2),     %% virtual table-name
+    {_OrgTable, Rest4} = lenenc_str(Rest3),  %% physical table-name
     {Name, Rest5} = lenenc_str(Rest4),       %% virtual column name
     {_OrgName, Rest6} = lenenc_str(Rest5),   %% physical column name
     {16#0c, Rest7} = lenenc_int(Rest6),      %% length of the following fields
@@ -459,7 +573,7 @@ decode_text(#col{type = T}, Text)
   when T == ?TYPE_STRING; T == ?TYPE_VARCHAR; T == ?TYPE_VAR_STRING;
        T == ?TYPE_ENUM; T == ?TYPE_SET; T == ?TYPE_LONG_BLOB;
        T == ?TYPE_MEDIUM_BLOB; T == ?TYPE_BLOB; T == ?TYPE_TINY_BLOB;
-       T == ?TYPE_GEOMETRY ->
+       T == ?TYPE_GEOMETRY; T == ?TYPE_JSON ->
     %% As of MySQL 5.6.21 we receive SET and ENUM values as STRING, i.e. we
     %% cannot convert them to atom() or sets:set(), etc.
     Text;
@@ -525,12 +639,12 @@ decode_text(#col{type = T}, Text) when T == ?TYPE_FLOAT;
 
 %% @doc If NumColumns is non-zero, fetches this number of column definitions
 %% and an EOF packet. Used by prepare/3.
-fetch_column_definitions_if_any(0, _TcpModule, _Socket, SeqNum) ->
+fetch_column_definitions_if_any(0, _SockModule, _Socket, SeqNum) ->
     {[], SeqNum};
-fetch_column_definitions_if_any(N, TcpModule, Socket, SeqNum) ->
-    {ok, Defs, SeqNum1} = fetch_column_definitions(TcpModule, Socket, SeqNum,
+fetch_column_definitions_if_any(N, SockModule, Socket, SeqNum) ->
+    {ok, Defs, SeqNum1} = fetch_column_definitions(SockModule, Socket, SeqNum,
                                                    N, []),
-    {ok, ?eof_pattern, SeqNum2} = recv_packet(TcpModule, Socket, SeqNum1),
+    {ok, ?eof_pattern, SeqNum2} = recv_packet(SockModule, Socket, SeqNum1),
     {Defs, SeqNum2}.
 
 %% @doc Decodes a packet representing a row in a binary result set.
@@ -607,20 +721,44 @@ decode_binary(#col{type = T}, Data)
   when T == ?TYPE_STRING; T == ?TYPE_VARCHAR; T == ?TYPE_VAR_STRING;
        T == ?TYPE_ENUM; T == ?TYPE_SET; T == ?TYPE_LONG_BLOB;
        T == ?TYPE_MEDIUM_BLOB; T == ?TYPE_BLOB; T == ?TYPE_TINY_BLOB;
-       T == ?TYPE_GEOMETRY ->
+       T == ?TYPE_GEOMETRY; T == ?TYPE_JSON ->
     %% As of MySQL 5.6.21 we receive SET and ENUM values as STRING, i.e. we
     %% cannot convert them to atom() or sets:set(), etc.
     lenenc_str(Data);
-decode_binary(#col{type = ?TYPE_LONGLONG},
-              <<Value:64/signed-little, Rest/binary>>) ->
+decode_binary(#col{type = ?TYPE_LONGLONG, flags = F},
+              <<Value:64/signed-little, Rest/binary>>)
+  when F band ?UNSIGNED_FLAG == 0 ->
     {Value, Rest};
-decode_binary(#col{type = T}, <<Value:32/signed-little, Rest/binary>>)
-  when T == ?TYPE_LONG; T == ?TYPE_INT24 ->
+decode_binary(#col{type = ?TYPE_LONGLONG, flags = F},
+              <<Value:64/unsigned-little, Rest/binary>>)
+  when F band ?UNSIGNED_FLAG /= 0 ->
     {Value, Rest};
-decode_binary(#col{type = T}, <<Value:16/signed-little, Rest/binary>>)
-  when T == ?TYPE_SHORT; T == ?TYPE_YEAR ->
+decode_binary(#col{type = T, flags = F},
+              <<Value:32/signed-little, Rest/binary>>)
+  when (T == ?TYPE_LONG orelse T == ?TYPE_INT24) andalso
+       F band ?UNSIGNED_FLAG == 0 ->
     {Value, Rest};
-decode_binary(#col{type = ?TYPE_TINY}, <<Value:8/signed, Rest/binary>>) ->
+decode_binary(#col{type = T, flags = F},
+              <<Value:32/unsigned-little, Rest/binary>>)
+  when (T == ?TYPE_LONG orelse T == ?TYPE_INT24) andalso
+       F band ?UNSIGNED_FLAG /= 0 ->
+    {Value, Rest};
+decode_binary(#col{type = ?TYPE_SHORT, flags = F},
+              <<Value:16/signed-little, Rest/binary>>)
+  when F band ?UNSIGNED_FLAG == 0 ->
+    {Value, Rest};
+decode_binary(#col{type = T, flags = F},
+              <<Value:16/unsigned-little, Rest/binary>>)
+  when (T == ?TYPE_SHORT orelse T == ?TYPE_YEAR) andalso
+       F band ?UNSIGNED_FLAG /= 0 ->
+    {Value, Rest};
+decode_binary(#col{type = ?TYPE_TINY, flags = F},
+              <<Value:8/unsigned, Rest/binary>>)
+  when F band ?UNSIGNED_FLAG /= 0 ->
+    {Value, Rest};
+decode_binary(#col{type = ?TYPE_TINY, flags = F},
+              <<Value:8/signed, Rest/binary>>)
+  when F band ?UNSIGNED_FLAG == 0 ->
     {Value, Rest};
 decode_binary(#col{type = T, decimals = S, length = L}, Data)
   when T == ?TYPE_DECIMAL; T == ?TYPE_NEWDECIMAL ->
@@ -652,7 +790,7 @@ decode_binary(#col{type = ?TYPE_FLOAT},
     %%     columns in mysql:
     %%
     %%     var yourNumber = some floating point value
-    %%     max decimal precision = 10 ^ (-5 + floor(yourNumber log 10))
+    %%     max decimal precision = 10 ^ (-5 + flooring(yourNumber log 10))
     %%     So:
     %%     0 < x < 10 -> max precision is 0.00001
     %%     10 <= x < 100 -> max precision is 0.0001
@@ -667,7 +805,7 @@ decode_binary(#col{type = ?TYPE_FLOAT},
     %%
     %% Now, instead of P = 0.00001 we want the inverse 100000.0 but if we
     %% compute Factor = 1 / P we get a precision loss, so instead we do this:
-    Factor = math:pow(10, floor(6 - math:log10(abs(Value)))),
+    Factor = math:pow(10, flooring(6 - math:log10(abs(Value)))),
     RoundedValue = round(Value * Factor) / Factor,
     {RoundedValue, Rest};
 decode_binary(#col{type = ?TYPE_BIT, length = Length}, Data) ->
@@ -727,7 +865,7 @@ decode_binary(#col{type = ?TYPE_TIME}, <<Length, Data/binary>>) ->
     end.
 
 %% @doc Like trunc/1 but towards negative infinity instead of towards zero.
-floor(Value) ->
+flooring(Value) ->
     Trunc = trunc(Value),
     if
         Trunc =< Value -> Trunc;
@@ -842,40 +980,40 @@ decode_decimal(Bin, P, S) when P >= 16, S > 0 ->
 
 %% -- Protocol basics: packets --
 
-%% @doc Wraps Data in packet headers, sends it by calling TcpModule:send/2 with
+%% @doc Wraps Data in packet headers, sends it by calling SockModule:send/2 with
 %% Socket and returns {ok, SeqNum1} where SeqNum1 is the next sequence number.
 -spec send_packet(atom(), term(), Data :: binary(), SeqNum :: integer()) ->
     {ok, NextSeqNum :: integer()}.
-send_packet(TcpModule, Socket, Data, SeqNum) ->
+send_packet(SockModule, Socket, Data, SeqNum) ->
     {WithHeaders, SeqNum1} = add_packet_headers(Data, SeqNum),
-    ok = TcpModule:send(Socket, WithHeaders),
+    ok = SockModule:send(Socket, WithHeaders),
     {ok, SeqNum1}.
 
 %% @see recv_packet/4
-recv_packet(TcpModule, Socket, SeqNum) ->
-    recv_packet(TcpModule, Socket, infinity, SeqNum).
+recv_packet(SockModule, Socket, SeqNum) ->
+    recv_packet(SockModule, Socket, infinity, SeqNum).
 
-%% @doc Receives data by calling TcpModule:recv/2 and removes the packet
+%% @doc Receives data by calling SockModule:recv/2 and removes the packet
 %% headers. Returns the packet contents and the next packet sequence number.
 -spec recv_packet(atom(), term(), timeout(), integer() | any) ->
     {ok, Data :: binary(), NextSeqNum :: integer()} | {error, term()}.
-recv_packet(TcpModule, Socket, Timeout, SeqNum) ->
-    recv_packet(TcpModule, Socket, Timeout, SeqNum, <<>>).
+recv_packet(SockModule, Socket, Timeout, SeqNum) ->
+    recv_packet(SockModule, Socket, Timeout, SeqNum, <<>>).
 
 %% @doc Accumulating helper for recv_packet/4
 -spec recv_packet(atom(), term(), timeout(), integer() | any, binary()) ->
     {ok, Data :: binary(), NextSeqNum :: integer()} | {error, term()}.
-recv_packet(TcpModule, Socket, Timeout, ExpectSeqNum, Acc) ->
-    case TcpModule:recv(Socket, 4, Timeout) of
+recv_packet(SockModule, Socket, Timeout, ExpectSeqNum, Acc) ->
+    case SockModule:recv(Socket, 4, Timeout) of
         {ok, Header} ->
             {Size, SeqNum, More} = parse_packet_header(Header),
             true = SeqNum == ExpectSeqNum orelse ExpectSeqNum == any,
-            {ok, Body} = TcpModule:recv(Socket, Size),
+            {ok, Body} = SockModule:recv(Socket, Size),
             Acc1 = <<Acc/binary, Body/binary>>,
             NextSeqNum = (SeqNum + 1) band 16#ff,
             case More of
                 false -> {ok, Acc1, NextSeqNum};
-                true  -> recv_packet(TcpModule, Socket, Timeout, NextSeqNum,
+                true  -> recv_packet(SockModule, Socket, Timeout, NextSeqNum,
                                      Acc1)
             end;
         {error, Reason} ->
@@ -900,17 +1038,19 @@ parse_packet_header(<<PacketLength:24/little-integer, SeqNum:8/integer>>) ->
     {PacketLength, SeqNum, PacketLength == 16#ffffff}.
 
 %% @doc Splits a packet body into chunks and wraps them in headers. The
-%% resulting list is ready to sent to the socket.
--spec add_packet_headers(PacketBody :: iodata(), SeqNum :: integer()) ->
-    {PacketWithHeaders :: iodata(), NextSeqNum :: integer()}.
-add_packet_headers(PacketBody, SeqNum) ->
-    Bin = iolist_to_binary(PacketBody),
-    Size = size(Bin),
+%% resulting list is ready to be sent to the socket. The result is built as a
+%% list to avoid copying large binaries.
+-spec add_packet_headers(Data :: binary(), SeqNum :: integer()) ->
+    {PacketsWithHeaders :: iodata(), NextSeqNum :: integer()}.
+add_packet_headers(<<Payload:16#ffffff/binary, Rest/binary>>, SeqNum) ->
     SeqNum1 = (SeqNum + 1) band 16#ff,
-    %% Todo: implement the case when Size >= 16#ffffff.
-    if Size < 16#ffffff ->
-        {[<<Size:24/little, SeqNum:8>>, Bin], SeqNum1}
-    end.
+    {Packets, NextSeqNum} = add_packet_headers(Rest, SeqNum1),
+    Header = <<16#ffffff:24/little, SeqNum:8>>,
+    {[Header, Payload | Packets], NextSeqNum};
+add_packet_headers(Bin, SeqNum) when byte_size(Bin) < 16#ffffff ->
+    NextSeqNum = (SeqNum + 1) band 16#ff,
+    Header = <<(byte_size(Bin)):24/little, SeqNum:8>>,
+    {[Header, Bin], NextSeqNum}.
 
 -spec parse_ok_packet(binary()) -> #ok{}.
 parse_ok_packet(<<?OK:8, Rest/binary>>) ->
@@ -953,6 +1093,24 @@ parse_eof_packet(<<?EOF:8, NumWarnings:16/little, StatusFlags:16/little>>) ->
     %% (Older protocol: <<?EOF:8>>)
     #eof{status = StatusFlags, warning_count = NumWarnings}.
 
+-spec parse_auth_method_switch(binary()) -> #auth_method_switch{}.
+parse_auth_method_switch(AMSData) ->
+    {AuthPluginName, AuthPluginData} = get_null_terminated_binary(AMSData),
+    #auth_method_switch{
+       auth_plugin_name = AuthPluginName,
+       auth_plugin_data = AuthPluginData
+      }.
+
+-spec get_null_terminated_binary(binary()) -> {Binary :: binary(),
+                                               Rest :: binary()}.
+get_null_terminated_binary(In) ->
+    get_null_terminated_binary(In, <<>>).
+
+get_null_terminated_binary(<<0, Rest/binary>>, Acc) ->
+    {Acc, Rest};
+get_null_terminated_binary(<<Ch, Rest/binary>>, Acc) ->
+    get_null_terminated_binary(Rest, <<Acc/binary, Ch>>).
+
 -spec hash_password(Password :: iodata(), Salt :: binary()) -> Hash :: binary().
 hash_password(Password, Salt) ->
     %% From the "MySQL Internals" manual:
@@ -963,6 +1121,18 @@ hash_password(Password, Salt) ->
     %%
     %% The auth data is obviously nul-terminated. For the "native" auth
     %% method, it should be a 20 byte salt, so let's trim it in this case.
+    PasswordBin = case erlang:is_binary(Password) of
+        true -> Password;
+        false -> erlang:iolist_to_binary(Password)
+    end,
+    case PasswordBin =:= <<>> of
+        true -> <<>>;
+        false -> hash_non_empty_password(Password, Salt)
+    end.
+
+-spec hash_non_empty_password(Password :: iodata(), Salt :: binary()) ->
+    Hash :: binary().
+hash_non_empty_password(Password, Salt) ->
     Salt1 = case Salt of
         <<SaltNoNul:20/binary-unit:8, 0>> -> SaltNoNul;
         _ when size(Salt) == 20           -> Salt
@@ -1117,6 +1287,27 @@ add_packet_headers_test() ->
     {Data, 43} = add_packet_headers(<<"foo">>, 42),
     ?assertEqual(<<3, 0, 0, 42, "foo">>, list_to_binary(Data)).
 
+add_packet_headers_equal_to_0xffffff_test() ->
+    BigBin = binary:copy(<<1>>, 16#ffffff),
+    {Data, 44} = add_packet_headers(BigBin, 42),
+    ?assertEqual(<<16#ff, 16#ff, 16#ff, 42, BigBin/binary,
+                   0,     0,     0,     43>>,
+                 list_to_binary(Data)).
+
+add_packet_headers_greater_than_0xffffff_test() ->
+    BigBin = binary:copy(<<1>>, 16#ffffff),
+    {Data, 44} = add_packet_headers(<<BigBin/binary, "foo">>, 42),
+    ?assertEqual(<<16#ff, 16#ff, 16#ff, 42, BigBin/binary, 3, 0, 0, 43, "foo">>,
+                 list_to_binary(Data)).
+
+add_packet_headers_2_times_greater_than_0xffffff_test() ->
+    BigBin = binary:copy(<<1>>, 16#ffffff),
+    {Data, 45} = add_packet_headers(<<BigBin/binary, BigBin/binary, "foo">>, 42),
+    ?assertEqual(<<16#ff, 16#ff, 16#ff, 42, BigBin/binary,
+                   16#ff, 16#ff, 16#ff, 43, BigBin/binary,
+                   3,     0,     0,     44, "foo">>,
+                 list_to_binary(Data)).
+
 parse_ok_test() ->
     Body = <<0, 5, 1, 2, 0, 0, 0, "Foo">>,
     ?assertEqual(#ok{affected_rows = 5,
@@ -1146,6 +1337,7 @@ parse_eof_test() ->
 hash_password_test() ->
     ?assertEqual(<<222,207,222,139,41,181,202,13,191,241,
                    234,234,73,127,244,101,205,3,28,251>>,
-                 hash_password(<<"foo">>, <<"abcdefghijklmnopqrst">>)).
+                 hash_password(<<"foo">>, <<"abcdefghijklmnopqrst">>)),
+    ?assertEqual(<<>>, hash_password(<<>>, <<"abcdefghijklmnopqrst">>)).
 
 -endif.

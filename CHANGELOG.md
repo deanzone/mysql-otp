@@ -1,6 +1,70 @@
 Change log
 ==========
 
+* Mention exit(Pid, normal) in README and a test [2018-11-21 00:51:58 +0100]
+* Return an error on deadlock if all retries fail in a transaction [2018-10-07 20:35:39 +0200]
+* Set gen_server-timeouts for transaction statements to infinity (#91) [2018-10-06 21:39:14 +0200]
+
+1.3.3
+-----
+* Compatibility with OTP 21.1 (#84) [2018-10-02 18:23:43 +0200]
+* Don't restart transaction on lock wait timeout (#89) [2018-09-18 11:10:57 +0200]
+* Make the Travis CI status show the master branch [2018-07-01 00:33:10 +0200]
+* Update README.md [2018-04-13 04:33:52 +0200]
+* Fixed a Typo in the doc [2018-03-21 11:13:26 +0100]
+* Update CHANGELOG.md [2018-03-20 02:44:37 +0100]
+
+1.3.2
+-----
+* Rewrite add_packet_headers and update version [2018-03-20 02:42:43 +0100]
+* Sending packets with size greater than 16#ffffff (#77) [2018-03-20 00:16:48 +0100]
+* Update CHANGELOG.md [2018-01-05 07:28:11 +0100]
+
+1.3.1
+-----
+* Update .app.src file and README for version 1.3.1 [2018-01-05 07:26:58 +0100]
+* Check handshake status, ignoring bit 16#4000, SERVER_SESSION_STATE_CHANGED [2017-12-28 17:29:40 +0100]
+* Ignore mysql.d [2017-12-28 17:29:40 +0100]
+* Compatible with MySQL 5.7 and MariaDB 10.2.6+ [2017-12-28 17:29:40 +0100]
+* Update README again [2017-11-23 22:36:34 +0100]
+* Update README [2017-11-23 22:34:24 +0100]
+* Move SSL tests to separate suite [2017-11-23 22:07:18 +0100]
+* Linebreak long lines [2017-11-23 22:05:51 +0100]
+* Update erlang.mk and fix dialyzer plt apps [2017-11-23 22:04:39 +0100]
+* Update changelog 1.3.0 [2017-11-23 21:57:57 +0100]
+
+1.3.0
+-----
+* add erlang 20 for test [2017-09-21 13:32:38 +0200]
+* Add SSL connection support [2017-09-21 13:28:43 +0200]
+* Fix reading of unsigned integers in binary protocol [2017-08-02 00:09:54 +0200]
+* fix mysql connect timeout. [2017-08-02 00:06:42 +0200]
+* Add support for auth method switch [2017-08-02 00:05:04 +0200]
+* Fix tests for MariaDB [2017-08-01 23:58:33 +0200]
+* erlang 20 add floor/1 function, change the floor/1 funcion name in the self create module [2017-05-11 17:07:50 +0800]
+* Add test for found_rows option. [2017-01-31 10:52:43 +0100]
+* Allow setting CLIENT_FOUND_ROWS on handshake. [2017-01-31 10:45:17 +0100]
+* Add Erlang 19 and 18 to Travis build matrix [2016-08-27 02:04:37 +0200]
+* Add support for the MySQL JSON type [2016-08-27 01:41:43 +0200]
+* Explicitly set the SQL mode to a known value [2016-07-23 13:08:13 +0200]
+* Fix typo 'Gitbub' in docs [2016-07-01 15:44:29 +0200]
+* Update CHANGELOG.md [2016-06-18 06:37:52 +0200]
+
+1.2.0
+-----
+* Bump version to 1.2.0 [2016-06-18 06:37:07 +0200]
+* Add test for server disconnect and tcp error [2016-06-18 06:27:51 +0200]
+* Fixes typo: Set active once after executing prepared statement [2016-06-18 06:27:43 +0200]
+* Stop the gen_server when mysql server closes connection [2016-06-11 16:11:06 +0200]
+* Properly handling empty passwords [2016-02-19 16:41:09 -0800]
+* this change required for the elixir/exrm to package this as a dependency. [2016-01-05 12:40:41 -0600]
+
+1.1.1
+-----
+* Bumb version 1.1.1 [2015-09-13 12:09:33 +0200]
+* Skip lock wait timeout test when setting the timeout is not possible [2015-09-13 11:56:57 +0200]
+* Don't check the multi capabilities from the server; fixes #31 [2015-09-13 11:55:46 +0200]
+* Update CHANGELOG.md [2015-08-31 16:39:43 +0200]
 
 1.1.0
 -----
